@@ -264,6 +264,26 @@ const requested_lock = NonReentrantLock()
 const requested = PerDevice{Dict{CuPtr{Nothing},Vector}}() do dev
   Dict{CuPtr{Nothing},Vector}()
 end
+#=
+const refcount_backtraces = PerDevice{Dict{CuPtr{Nothing},Vector}}() do dev
+    Dict{CuPtr{Nothing},Vector}()
+end
+=#
+const refcount_backtraces = Dict{CuPtr{Nothing},Vector}()
+
+function find_double_free()
+    for ptr in keys(refcount_backtraces)
+        rcbt = refcount_backtraces[ptr]
+        if any(x->x[1]==-1, rcbt)
+            printstyled(stderr, "Broken refcounting for $ptr:\n"; color=:red)
+            for x in rcbt
+                print(stderr, x[1])
+                Base.show_backtrace(stderr, x[2])
+                println(stderr)
+            end
+        end
+    end
+end
 
 """
     OutOfGPUMemoryError()
@@ -299,9 +319,12 @@ a [`OutOfGPUMemoryError`](@ref) if the allocation request cannot be satisfied.
 
   # record the memory block
   ptr = pointer(block)
+  bt = backtrace()
   @safe_lock allocated_lock begin
       @assert !haskey(allocated[dev], ptr)
       allocated[dev][ptr] = block, 1
+      rcbt = get!(()->[], refcount_backtraces, ptr)
+      push!(rcbt, (1, bt))
   end
 
   # record the allocation site
@@ -310,6 +333,7 @@ a [`OutOfGPUMemoryError`](@ref) if the allocation request cannot be satisfied.
     @lock requested_lock begin
       @assert !haskey(requested[dev], ptr)
       requested[dev][ptr] = bt
+
     end
   end
 
@@ -337,9 +361,12 @@ multiple calls to `free` before this buffer is put back into the memory pool.
   dev = device()
 
   # look up the memory block
+  bt = backtrace()
   @safe_lock_spin allocated_lock begin
     block, refcount = allocated[dev][ptr]
     allocated[dev][ptr] = block, refcount+1
+    rcbt = get!(()->[], refcount_backtraces, ptr)
+    push!(rcbt, (refcount+1, bt))
   end
 
   return
@@ -365,8 +392,14 @@ Releases a buffer pointed to by `ptr` to the memory pool.
   # so perform our own error handling.
   try
     # look up the memory block, and bail out if its refcount isn't 1
+    bt = backtrace()
     block = @safe_lock_spin allocated_lock begin
+        rcbt = get!(()->[], refcount_backtraces, ptr)
+        if !haskey(allocated[dev], ptr)
+            push!(rcbt, (-1, bt))
+        end
         block, refcount = allocated[dev][ptr]
+        push!(rcbt, (refcount-1, bt))
         if refcount == 1
           delete!(allocated[dev], ptr)
           block
@@ -641,6 +674,7 @@ function __init_pool__()
   # allocation tracking
   initialize!(allocated, ndevices())
   initialize!(requested, ndevices())
+  #initialize!(refcount_backtraces, ndevices())
 
   # memory pool configuration
   runtime_pool_name = get(ENV, "JULIA_CUDA_MEMORY_POOL", "binned")

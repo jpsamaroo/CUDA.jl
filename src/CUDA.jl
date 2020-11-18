@@ -85,6 +85,10 @@ include("iterator.jl")
 include("statistics.jl")
 include("random.jl")
 
+using Serialization
+Serialization.serialize(s::Serialization.AbstractSerializer, ptr::CuPtr) =
+    error("Serialization of CuPtr disallowed")
+
 # other libraries
 include("../lib/nvml/NVML.jl")
 const has_nvml = NVML.has_nvml
